@@ -5,6 +5,8 @@ import numpy as np
 import threading
 import time
 import os
+import requests
+
 
 # Load the Whisper model
 model = whisper.load_model("base")  # Use "tiny", "base", "small", "medium", "large"
@@ -50,6 +52,21 @@ def capture_audio():
     stream.stop_stream()
     stream.close()
 
+def getResponseFromLLm(prompt):
+    url = "http://localhost:11434/api/generate"
+    data = {
+        "model": "deepseek-r1:1.5b",
+        "prompt": prompt,
+        "stream": False
+    }
+
+    response = requests.post(url, json=data)
+    if response.status_code == 200:
+        response_data = response.json()
+        print("Response from LLm:", response_data.get("response", "No response received"))
+    else:
+        print(f"Error: {response.status_code}, {response.text}")
+
 def transcribe_audio():
     """Continuously transcribes the latest recorded audio."""
     while recording:
@@ -58,6 +75,7 @@ def transcribe_audio():
             with audio_lock:  # Ensure the file is not being written while reading
                 result = model.transcribe("temp.wav")
             print("Transcription:", result["text"])
+            getResponseFromLLm(result["text"])
 
 # Start threads
 capture_thread = threading.Thread(target=capture_audio)
