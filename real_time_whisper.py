@@ -10,12 +10,18 @@ import struct
 from queue import Queue
 import numpy as np
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain_community.llms import Ollama
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+
 load_dotenv()
 
 
 class VoiceAssistant:
     def __init__(self, whisper_model="tiny", sample_rate=16000, chunk_size=1024, 
-                 wake_word="computer", llm_model="deepseek-r1:1.5b", 
+                 wake_word="computer", model="deepseek-r1:1.5b", 
                  llm_endpoint="http://localhost:11434/api/generate"):
         # Configuration
         self.FORMAT = pyaudio.paInt16
@@ -23,9 +29,11 @@ class VoiceAssistant:
         self.RATE = sample_rate
         self.CHUNK = chunk_size
         self.whisper_model = whisper_model
-        self.llm_model = llm_model
+        self.llm_model = Ollama(model=model)
         self.llm_endpoint = llm_endpoint
         self.wake_word = wake_word
+        self.output_parser=StrOutputParser()
+
         
         # State variables
         self.recording = False
@@ -193,31 +201,62 @@ class VoiceAssistant:
         except Exception as e:
             print(f"Error in transcription: {e}")
     
-    def get_llm_response(self, prompt):
-        """Get response from LLM API."""
+    def get_llm_response(self, question):
+        """Get response from LLM API for database-related queries only."""
         try:
-            print(f"Sending to LLM: '{prompt}'")
-            data = {
-                "model": self.llm_model,
-                "prompt": prompt,
-                "stream": False
-            }
-            
-            response = requests.post(self.llm_endpoint, json=data)
-            
-            if response.status_code == 200:
-                response_data = response.json()
-                llm_response = response_data.get("response", "No response received")
-                print(f"LLM Response: {llm_response}")
-                # Here you could add text-to-speech output
-            else:
-                print(f"LLM API error: {response.status_code}, {response.text}")
-                
-        # except requests.exceptions.Timeout:
-        #     print("LLM request timed out")
-        except Exception as e:
-            print(f"Error getting LLM response: {e}")
+            # More explicit and restrictive system prompt
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are a specialized database assistant that ONLY answers questions about:
+    - SQL queries and syntax
+    - Database design and architecture
+    - Database management systems (MySQL, PostgreSQL, MongoDB, etc.)
+    - Data modeling and normalization
+    - Database performance and optimization
+    - Database administration tasks
 
+    For ANY question not directly related to databases, respond ONLY with:
+    "I can only answer database-related questions. Please ask a question about databases or SQL."
+
+    DO NOT answer questions about other topics, even if they seem related to programming or data.
+    Be concise and direct in your answers to database questions."""),
+                ("user", "Question: {question}")
+            ])
+            
+            print(f"Sending to LLM: '{question}'")
+            
+            # Check if it's likely a database question before sending to the model
+            is_db_related = self._is_database_question(question)
+            
+            if not is_db_related:
+                print("I can only answer database-related questions. Please ask a question about databases or SQL.")
+                return
+            
+            # If it seems database related, proceed with the LLM
+            chain = prompt | self.llm_model | self.output_parser
+            llm_response = chain.invoke({"question": question})
+            print(f"LLM Response: {llm_response}")
+            return llm_response
+                
+        except Exception as e:
+            error_msg = f"Error getting LLM response: {e}"
+            print(error_msg)
+            return "Sorry, I encountered an error processing your database question."
+        
+    def _is_database_question(self, question):
+        """Basic check if question is likely database related."""
+        # List of database-related keywords
+        db_keywords = [
+            "database", "sql", "query", "table", "column", "row", "mysql", "postgresql", 
+            "mongodb", "nosql", "schema", "index", "primary key", "foreign key", 
+            "join", "select", "insert", "update", "delete", "where", "from", 
+            "normalization", "transaction", "procedure", "function", "view", "trigger"
+        ]
+        
+        # Convert to lowercase for case-insensitive matching
+        question_lower = question.lower()
+        
+        # Check if any database keyword is in the question
+        return any(keyword in question_lower for keyword in db_keywords)
 
 if __name__ == "__main__":
     assistant = VoiceAssistant(
