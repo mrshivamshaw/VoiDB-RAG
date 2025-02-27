@@ -1,3 +1,4 @@
+import streamlit as st
 import whisper
 import pyaudio
 import wave
@@ -14,14 +15,32 @@ from langchain_openai import ChatOpenAI
 from langchain_community.llms import Ollama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import OpenAIEmbeddings
+import mysql.connector
+import pyttsx3
+from langchain_core.documents import Document
+from langchain_community.vectorstores.faiss import FAISS
+import numpy as np
+import faiss
+from langchain_community.docstore.in_memory import InMemoryDocstore
+import re
+import tempfile
+from io import BytesIO
+import sounddevice as sd
+import soundfile as sf
+from PIL import Image
 
+# Disable PyTorch module watching to prevent errors
+st._config.get_option('server.runOnSave')
+st._config.set_option('server.runOnSave', False)
 
+# Load environment variables
 load_dotenv()
-
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 class VoiceAssistant:
     def __init__(self, whisper_model="tiny", sample_rate=16000, chunk_size=1024, 
-                 wake_word="computer", model="deepseek-r1:1.5b", 
+                 wake_word="computer", db_config=None, model="deepseek-r1:1.5b", 
                  llm_endpoint="http://localhost:11434/api/generate"):
         # Configuration
         self.FORMAT = pyaudio.paInt16
@@ -32,8 +51,8 @@ class VoiceAssistant:
         self.llm_model = Ollama(model=model)
         self.llm_endpoint = llm_endpoint
         self.wake_word = wake_word
-        self.output_parser=StrOutputParser()
-
+        self.output_parser = StrOutputParser()
+        self.db_config = db_config
         
         # State variables
         self.recording = False
@@ -46,221 +65,436 @@ class VoiceAssistant:
         self.model = whisper.load_model(whisper_model)
         print("Whisper model loaded.")
         
-        # Initialize Porcupine wake word detector
-        self.porcupine = pvporcupine.create(
-            access_key=os.getenv("PVPORCUPINE_ACCESS_KEY"), 
-            keywords=[wake_word]
-        )
+        # Initialize Porcupine wake word detector if access key is available
+        if os.getenv("PVPORCUPINE_ACCESS_KEY"):
+            self.porcupine = pvporcupine.create(
+                access_key=os.getenv("PVPORCUPINE_ACCESS_KEY"), 
+                keywords=[wake_word]
+            )
+        else:
+            print("Warning: PVPORCUPINE_ACCESS_KEY not found. Wake word detection disabled.")
+            self.porcupine = None
         
-    def start(self):
-        """Start all threads and the voice assistant."""
-        # Create and start threads
-        threads = [
-            threading.Thread(target=self.detect_wake_word, daemon=True),
-            threading.Thread(target=self.process_audio_queue, daemon=True)
-        ]
+        # Initialize FAISS for schema-based retrieval
+        if self.db_config:
+            self.vector_db = self._setup_vector_db()
+        else:
+            print("Warning: No database configuration provided. Database functionality disabled.")
+            self.vector_db = None
         
-        for thread in threads:
-            thread.start()
-            
-        print(f"Voice assistant started. Listening for wake word '{self.wake_word}'...")
-        
+    def _setup_vector_db(self):
+        """Extracts database schema and stores it in a vector database."""
         try:
-            while self.running:
-                time.sleep(0.1)  # Reduced sleep time for more responsive shutdown
-        except KeyboardInterrupt:
-            self.stop()
-        
-        for thread in threads:
-            thread.join(timeout=1.0)  # Add timeout to prevent hanging
-            
-        print("Voice assistant stopped.")
-            
-    def stop(self):
-        """Stop all threads and cleanup resources."""
-        print("\nStopping voice assistant...")
-        self.running = False
-        self.recording = False
-        
-        # Clean up resources
-        if hasattr(self, 'porcupine'):
-            self.porcupine.delete()
-        if hasattr(self, 'audio'):
-            self.audio.terminate()
-    
-    def detect_wake_word(self):
-        """Listen for wake word continuously."""
-        wake_word_stream = self.audio.open(
-            rate=self.porcupine.sample_rate,
-            channels=1,
-            format=self.FORMAT,
-            input=True,
-            frames_per_buffer=self.porcupine.frame_length
-        )
-        
-        while self.running:
-            try:
-                pcm = wake_word_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
-                pcm_unpacked = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
-                
-                keyword_index = self.porcupine.process(pcm_unpacked)
-                if keyword_index >= 0:
-                    print(f"\nWake word '{self.wake_word}' detected! Listening...")
-                    self.record_audio()
-            except Exception as e:
-                print(f"Error in wake word detection: {e}")
-                time.sleep(0.5)  # Brief pause on error
-                
-        wake_word_stream.close()
-                
-    def record_audio(self):
-        """Record audio for processing after wake word detection."""
-        frames = []
-        audio_stream = self.audio.open(
-            format=self.FORMAT,
-            channels=self.CHANNELS,
-            rate=self.RATE,
-            input=True,
-            frames_per_buffer=self.CHUNK
-        )
-        
-        # Record for maximum 5 seconds (configurable)
-        max_recording_time = 5  # seconds
-        silence_threshold = 300  # Adjust based on your microphone sensitivity
-        silence_duration = 0.5   # Stop after 0.5s of silence
-        
-        print("Recording...")
-        recording_start = time.time()
-        silence_start = None
-        
-        try:
-            while self.running and (time.time() - recording_start) < max_recording_time:
-                data = audio_stream.read(self.CHUNK, exception_on_overflow=False)
-                frames.append(data)
-                
-                # Simple silence detection
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                if np.abs(audio_data).mean() < silence_threshold:
-                    if silence_start is None:
-                        silence_start = time.time()
-                    elif time.time() - silence_start > silence_duration:
-                        print("Silence detected, stopping recording")
-                        break
-                else:
-                    silence_start = None
-                    
-            # Only process if we have enough audio
-            if len(frames) > 5:  # At least 5 chunks to be meaningful
-                audio_file = "temp.wav"
-                with wave.open(audio_file, "wb") as wf:
-                    wf.setnchannels(self.CHANNELS)
-                    wf.setsampwidth(self.audio.get_sample_size(self.FORMAT))
-                    wf.setframerate(self.RATE)
-                    wf.writeframes(b''.join(frames))
-                
-                self.audio_queue.put(audio_file)
-                
+            schema_texts = self._extract_db_schema()
+            documents = [Document(page_content=text) for text in schema_texts]
+            embeddings = OpenAIEmbeddings()
+            embedded_docs = embeddings.embed_documents([doc.page_content for doc in documents])
+
+            # Normalize embeddings for cosine similarity
+            embedded_docs = [vec / np.linalg.norm(vec) for vec in embedded_docs]
+
+            # Create FAISS index with IndexFlatIP for cosine similarity
+            dimension = len(embedded_docs[0])
+            index = faiss.IndexFlatIP(dimension)
+            index.add(np.array(embedded_docs, dtype=np.float32))
+
+            # Create document store and mapping
+            docstore = InMemoryDocstore({str(i): doc for i, doc in enumerate(documents)})
+            index_to_docstore_id = {i: str(i) for i in range(len(documents))}
+
+            # Instantiate FAISS with the correct arguments
+            return FAISS(
+                embedding_function=embeddings,
+                index=index,
+                docstore=docstore,
+                index_to_docstore_id=index_to_docstore_id
+            )
         except Exception as e:
-            print(f"Error during recording: {e}")
-        finally:
-            audio_stream.close()
+            print(f"Error setting up vector database: {e}")
+            return None
     
-    def process_audio_queue(self):
-        """Process audio files in the queue."""
-        while self.running:
-            try:
-                if not self.audio_queue.empty():
-                    audio_file = self.audio_queue.get()
-                    print("Transciption started...")
-                    self.transcribe_and_respond(audio_file)
-                else:
-                    time.sleep(0.1)  # Short sleep when queue is empty
-            except Exception as e:
-                print(f"Error processing audio: {e}")
-                time.sleep(0.5)
-    
-    def transcribe_and_respond(self, audio_file):
-        """Transcribe audio and get response from LLM."""
+    def _extract_db_schema(self):
+        """Fetches schema information from MySQL."""
         try:
-            print("Transcribing audio...")
-            result = self.model.transcribe(audio_file)
-            transcription = result["text"].strip()
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute("SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s", (self.db_config['database'],))
+            schema_info = cursor.fetchall()
+            cursor.close()
+            conn.close()
             
-            if transcription:
-                print(f"Transcription: {transcription}")
-                self.get_llm_response(transcription)
-            else:
-                print("No speech detected.")
-                
-            # Clean up the temporary file
-            try:
-                os.remove(audio_file)
-            except:
-                pass
-                
+            schema_texts = []
+            table_structure = {}
+            for table, column, dtype in schema_info:
+                if table not in table_structure:
+                    table_structure[table] = []
+                table_structure[table].append(f"{column} ({dtype})")
+            
+            for table, columns in table_structure.items():
+                schema_texts.append(f"Table: {table}, Columns: {', '.join(columns)}")
+            
+            return schema_texts
         except Exception as e:
-            print(f"Error in transcription: {e}")
+            print(f"Error extracting database schema: {e}")
+            return []
     
     def get_llm_response(self, question):
-        """Get response from LLM API for database-related queries only."""
+        """Retrieve response from LLM or execute SQL query if applicable."""
+        if not self.vector_db:
+            return "Database functionality is not available."
+            
+        retrieved_docs_with_scores = self.vector_db.similarity_search_with_score(question, k=1)
+        if not retrieved_docs_with_scores:
+            return "Query is out of schema context!"
+        
+        doc, score = retrieved_docs_with_scores[0]
+        if score > 1.0:  # L2 distance threshold, lower is better (tune this value)
+            return "Query is not sufficiently related to the schema."
+        
+        schema_text = doc.page_content
+        # raw_response = self._generate_sql(question, schema_text)
+        # sql_query = self._clean_sql_output(raw_response)
+        sql_query = self._clean_sql_output("SELECT name FROM users")
+        
+        if not self.is_likely_sql(sql_query):
+            return "Could not generate a valid SQL query."
+        print(sql_query)
+        return self._execute_sql(sql_query)
+    
+    def _generate_sql(self, question, schema_text):
+        """Generate an SQL query from natural language using schema context."""
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an expert SQL query generator. Based on the provided database schema, generate only the SQL query for the given user question. Do not include any explanations, additional text, or comments."),
+            ("user", "Schema: {schema}\nQuestion: {question}")
+        ])
+        
+        chain = prompt | self.llm_model | self.output_parser
+        return chain.invoke({"question": question, "schema": schema_text})
+    
+    def _clean_sql_output(self, response):
+        """Remove any unwanted tags or explanations from the response."""
+        # Remove "<think>...</think>" and keep only the SQL part
+        match = re.search(r"SELECT.*", response, re.IGNORECASE | re.DOTALL)
+        return match.group(0).strip() if match else response.strip()
+    
+    def is_likely_sql(self, query):
+        """Basic check to see if the query is likely an SQL statement."""
+        query = query.strip().upper()
+        return query.startswith(('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP'))
+
+    def _execute_sql(self, query):
+        """Execute SQL query and return results."""
         try:
-            # More explicit and restrictive system prompt
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are a specialized database assistant that ONLY answers questions about:
-    - SQL queries and syntax
-    - Database design and architecture
-    - Database management systems (MySQL, PostgreSQL, MongoDB, etc.)
-    - Data modeling and normalization
-    - Database performance and optimization
-    - Database administration tasks
-
-    For ANY question not directly related to databases, respond ONLY with:
-    "I can only answer database-related questions. Please ask a question about databases or SQL."
-
-    DO NOT answer questions about other topics, even if they seem related to programming or data.
-    Be concise and direct in your answers to database questions."""),
-                ("user", "Question: {question}")
-            ])
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute(query)
+            results = cursor.fetchall()
             
-            print(f"Sending to LLM: '{question}'")
-            
-            # Check if it's likely a database question before sending to the model
-            is_db_related = self._is_database_question(question)
-            
-            if not is_db_related:
-                print("I can only answer database-related questions. Please ask a question about databases or SQL.")
-                return
-            
-            # If it seems database related, proceed with the LLM
-            chain = prompt | self.llm_model | self.output_parser
-            llm_response = chain.invoke({"question": question})
-            print(f"LLM Response: {llm_response}")
-            return llm_response
+            if results:
+                # Format results as a more readable string
+                column_names = [i[0] for i in cursor.description]
+                formatted_results = []
+                formatted_results.append(" | ".join(column_names))
+                formatted_results.append("-" * (len(" | ".join(column_names))))
                 
+                for row in results[:20]:  # Show up to 20 rows
+                    formatted_results.append(" | ".join(str(cell) for cell in row))
+                
+                result_text = "\n".join(formatted_results)
+                cursor.close()
+                conn.close()
+                return result_text
+            else:
+                cursor.close()
+                conn.close()
+                return "No results found."
         except Exception as e:
-            error_msg = f"Error getting LLM response: {e}"
-            print(error_msg)
-            return "Sorry, I encountered an error processing your database question."
+            return f"Error executing query: {e}"
+    
+    def transcribe_audio(self, audio_file):
+        """Transcribe audio file using Whisper model."""
+        try:
+            result = self.model.transcribe(audio_file)
+            print(result["text"].strip())
+            return result["text"].strip()
+        except Exception as e:
+            print(f"Error in transcription: {e}")
+            return ""
+
+def record_audio(duration, sample_rate):
+    """Record audio and return the data - moved outside of the Streamlit callback"""
+    audio_data = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
+    return audio_data
+
+def main():
+    # Set page config first
+    st.set_page_config(
+        page_title="Voice Database Assistant",
+        page_icon="🎤",
+        layout="wide"
+    )
+    
+    st.title("Voice Database Assistant")
+    
+    # Initialize session state variables
+    if 'assistant' not in st.session_state:
+        st.session_state.assistant = None
+    if 'recording' not in st.session_state:
+        st.session_state.recording = False
+    if 'audio_data' not in st.session_state:
+        st.session_state.audio_data = None
+    if 'response' not in st.session_state:
+        st.session_state.response = ""
+    if 'transcription' not in st.session_state:
+        st.session_state.transcription = ""
+    if 'processing_complete' not in st.session_state:
+        st.session_state.processing_complete = False
+    
+    # Sidebar for configuration
+    with st.sidebar:
+        st.header("Configuration")
         
-    def _is_database_question(self, question):
-        """Basic check if question is likely database related."""
-        # List of database-related keywords
-        db_keywords = [
-            "database", "sql", "query", "table", "column", "row", "mysql", "postgresql", 
-            "mongodb", "nosql", "schema", "index", "primary key", "foreign key", 
-            "join", "select", "insert", "update", "delete", "where", "from", 
-            "normalization", "transaction", "procedure", "function", "view", "trigger"
-        ]
+        # Database configuration
+        st.subheader("Database Settings")
+        db_host = st.text_input("Host", "localhost")
+        db_user = st.text_input("User", "root")
+        db_password = st.text_input("Password", "", type="password")
+        db_name = st.text_input("Database", "testing")
         
-        # Convert to lowercase for case-insensitive matching
-        question_lower = question.lower()
+        # Model configuration
+        st.subheader("Model Settings")
+        whisper_model = st.selectbox("Whisper Model", ["tiny", "base", "small", "medium"], index=0)
+        llm_model = st.text_input("LLM Model", "deepseek-r1:1.5b")
         
-        # Check if any database keyword is in the question
-        return any(keyword in question_lower for keyword in db_keywords)
+        # Wake word configuration
+        st.subheader("Wake Word Settings")
+        wake_word = st.text_input("Wake Word", "computer")
+        
+        # API Keys
+        st.subheader("API Keys")
+        pvporcupine_key = st.text_input("Picovoice Porcupine Key", os.getenv("PVPORCUPINE_ACCESS_KEY", ""), type="password")
+        openai_key = st.text_input("OpenAI API Key", os.getenv("OPENAI_API_KEY", ""), type="password")
+        
+        # Save configuration and initialize assistant
+        if st.button("Save Configuration"):
+            os.environ["PVPORCUPINE_ACCESS_KEY"] = pvporcupine_key
+            os.environ["OPENAI_API_KEY"] = openai_key
+            
+            # Initialize or update the assistant with new configuration
+            db_config = {
+                "host": db_host,
+                "user": db_user,
+                "password": db_password,
+                "database": db_name
+            }
+            
+            with st.spinner("Initializing assistant..."):
+                st.session_state.assistant = VoiceAssistant(
+                    whisper_model=whisper_model,
+                    wake_word=wake_word,
+                    db_config=db_config,
+                    model=llm_model
+                )
+            
+            st.success("Configuration saved and assistant initialized!")
+
+    # Main content area
+    tabs = st.tabs(["Voice Interaction", "Text Interaction", "Database Explorer"])
+    
+    # Voice Interaction Tab
+    with tabs[0]:
+        st.header("Voice Interaction")
+        
+        # Check if assistant is initialized
+        if st.session_state.assistant is None:
+            st.warning("Please save configuration in the sidebar first to initialize the assistant.")
+        else:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write("Press the button and speak your database query.")
+                
+                # Recording state management
+                start_recording = st.button("🎤 Start Recording", disabled=st.session_state.recording)
+                
+                if start_recording:
+                    st.session_state.recording = True
+                    st.session_state.processing_complete = False
+                    st.session_state.transcription = ""
+                    st.session_state.response = ""
+                    st.rerun()
+                
+                if st.session_state.recording:
+                    stop_button = st.button("⏹️ Stop Recording")
+                    status_placeholder = st.empty()
+                    status_placeholder.warning("Recording... Speak your database query.")
+                    progress_placeholder = st.empty()
+                    
+                    # Record audio
+                    duration = 5  # seconds
+                    sample_rate = 16000
+                    
+                    # Initialize audio recording
+                    if st.session_state.audio_data is None:
+                        st.session_state.audio_data = sd.rec(
+                            int(duration * sample_rate), 
+                            samplerate=sample_rate, 
+                            channels=1, 
+                            dtype='int16'
+                        )
+                        
+                        # Add progress bar for recording duration
+                        progress_bar = progress_placeholder.progress(0)
+                        for i in range(100):
+                            # Simulate progress during recording
+                            time.sleep(duration/100)
+                            progress_bar.progress(i + 1)
+                        
+                        sd.wait()  # Wait for recording to complete
+                    
+                    if stop_button or st.session_state.audio_data is not None:
+                        status_placeholder.info("Processing audio...")
+                        
+                        # Save recording to temporary file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmpfile:
+                            temp_filename = tmpfile.name
+                            sf.write(temp_filename, st.session_state.audio_data, sample_rate)
+                        
+                        # Transcribe audio
+                        with st.spinner("Transcribing..."):
+                            st.session_state.transcription = st.session_state.assistant.transcribe_audio(temp_filename)
+                        
+                        if st.session_state.transcription:
+                            status_placeholder.success(f"Transcription: {st.session_state.transcription}")
+                            
+                            # Process query
+                            with st.spinner("Processing query..."):
+                                st.session_state.response = st.session_state.assistant.get_llm_response(st.session_state.transcription)
+                        else:
+                            status_placeholder.error("Could not transcribe audio. Please try again.")
+                        
+                        # Clean up
+                        try:
+                            os.remove(temp_filename)
+                        except Exception as e:
+                            print(f"Error removing temp file: {e}")
+                        
+                        # Reset state for next recording
+                        st.session_state.recording = False
+                        st.session_state.audio_data = None
+                        st.session_state.processing_complete = True
+                        st.rerun()
+            
+            with col2:
+                st.write("Query results will appear here:")
+                
+                if st.session_state.response:
+                    st.code(st.session_state.response)
+    
+    # Text Interaction Tab
+    with tabs[1]:
+        st.header("Text Interaction")
+        
+        # Check if assistant is initialized
+        if st.session_state.assistant is None:
+            st.warning("Please save configuration in the sidebar first to initialize the assistant.")
+        else:
+            user_query = st.text_area("Enter your database query:", height=150)
+            
+            if st.button("Submit Query"):
+                if user_query:
+                    with st.spinner("Processing query..."):
+                        response = st.session_state.assistant.get_llm_response(user_query)
+                        st.session_state.response = response
+                        st.code(response)
+                else:
+                    st.warning("Please enter a query first.")
+    
+    # Database Explorer Tab
+    with tabs[2]:
+        st.header("Database Explorer")
+        
+        # Database connection
+        try:
+            db_config = {
+                "host": db_host,
+                "user": db_user,
+                "password": db_password,
+                "database": db_name
+            }
+            
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+            
+            # Get table list
+            cursor.execute("SHOW TABLES")
+            tables = [table[0] for table in cursor.fetchall()]
+            
+            if tables:
+                selected_table = st.selectbox("Select a table to explore:", tables)
+                
+                if selected_table:
+                    # Get table columns
+                    cursor.execute(f"DESCRIBE {selected_table}")
+                    columns = [col[0] for col in cursor.fetchall()]
+                    
+                    # Display table preview
+                    cursor.execute(f"SELECT * FROM {selected_table} LIMIT 10")
+                    rows = cursor.fetchall()
+                    
+                    if rows:
+                        st.write(f"Preview of table '{selected_table}':")
+                        
+                        # Create DataFrame-like display
+                        st.write("| " + " | ".join(columns) + " |")
+                        st.write("| " + " | ".join(["---"] * len(columns)) + " |")
+                        
+                        for row in rows:
+                            st.write("| " + " | ".join([str(cell) for cell in row]) + " |")
+                    else:
+                        st.info(f"Table '{selected_table}' is empty.")
+                        
+                    # Custom SQL query option
+                    st.subheader("Run custom SQL query")
+                    custom_query = st.text_area("Enter SQL query:", f"SELECT * FROM {selected_table} LIMIT 100;")
+                    
+                    if st.button("Run Query"):
+                        with st.spinner("Running query..."):
+                            try:
+                                cursor.execute(custom_query)
+                                results = cursor.fetchall()
+                                
+                                if results:
+                                    # Get column names
+                                    column_names = [i[0] for i in cursor.description]
+                                    
+                                    # Display results
+                                    st.write("Query results:")
+                                    
+                                    # Create DataFrame-like display
+                                    st.write("| " + " | ".join(column_names) + " |")
+                                    st.write("| " + " | ".join(["---"] * len(column_names)) + " |")
+                                    
+                                    for row in results[:100]:  # Limit to 100 rows for display
+                                        st.write("| " + " | ".join([str(cell) for cell in row]) + " |")
+                                else:
+                                    st.info("Query returned no results.")
+                            except Exception as e:
+                                st.error(f"Error executing query: {e}")
+            else:
+                st.warning(f"No tables found in database '{db_name}'.")
+                
+            # Close resources
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            st.error(f"Database connection error: {e}")
+            st.info("Please check your database configuration in the sidebar.")
+
+    # Footer
+    st.markdown("---")
+    st.markdown("Voice Database Assistant | Built with Streamlit")
 
 if __name__ == "__main__":
-    assistant = VoiceAssistant(
-        whisper_model="tiny",  # Use tiny model for faster processing
-        wake_word="computer"
-    )
-    assistant.start()
+    main()
