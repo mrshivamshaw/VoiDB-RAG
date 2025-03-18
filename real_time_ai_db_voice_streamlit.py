@@ -2,7 +2,7 @@ import streamlit as st
 import whisper
 import pyaudio
 import wave
-import threading
+import threading  # CHANGED: Added threading import
 import time
 import os
 import requests
@@ -152,14 +152,53 @@ class VoiceAssistant:
             return "Query is not sufficiently related to the schema."
         
         schema_text = doc.page_content
-        # raw_response = self._generate_sql(question, schema_text)
-        # sql_query = self._clean_sql_output(raw_response)
-        sql_query = self._clean_sql_output("SELECT name FROM users")
+        print(schema_text)
+        raw_response = self._generate_sql(question, schema_text)
+        sql_query = self._clean_sql_output(raw_response)
+        print(sql_query)
+        # sql_query = self._clean_sql_output("SELECT name FROM users")
         
         if not self.is_likely_sql(sql_query):
             return "Could not generate a valid SQL query."
         print(sql_query)
-        return self._execute_sql(sql_query)
+        sql_response = self._execute_sql(sql_query)
+        return self._generate_final_response(sql_response,question)
+    
+    def _generate_final_response(self, sql_data, question):
+        """Generate a natural language response from SQL query results.
+        
+        Args:
+            sql_data (str): The results from the SQL query execution
+            question (str): The original natural language question asked by the user
+        
+        Returns:
+            str: A natural language response answering the user's question
+        """
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a database assistant that generates clear, concise responses based on SQL query results.
+
+    Your task is to:
+    1. Analyze the SQL query results provided
+    2. Understand the user's original question
+    3. Format the response in a natural, conversational way
+    4. Highlight key insights from the data
+    5. Include specific numbers and facts from the results
+    6. Keep responses concise and directly relevant to the question
+
+    If the data shows "No results found" or contains an error message, explain what this means in simple terms.
+
+    Respond in a helpful, direct manner without unnecessary explanations or SQL terminology unless requested."""),
+            ("user", """Original question: {question}
+
+    SQL query results:
+    {schema}
+
+    Please provide a natural language response that answers my question based on these results.""")
+        ])
+        
+        chain = prompt | self.llm_model | self.output_parser
+        response = chain.invoke({"question": question, "schema": sql_data})
+        return self._clean_response_output(response)
     
     def _generate_sql(self, question, schema_text):
         """Generate an SQL query from natural language using schema context."""
@@ -171,11 +210,19 @@ class VoiceAssistant:
         chain = prompt | self.llm_model | self.output_parser
         return chain.invoke({"question": question, "schema": schema_text})
     
+    def _clean_response_output(self, response):
+        """Remove any unwanted tags or explanations from the response."""
+        # Remove <think> tags and their contents
+        cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.IGNORECASE | re.DOTALL)
+        return cleaned
+    
     def _clean_sql_output(self, response):
         """Remove any unwanted tags or explanations from the response."""
-        # Remove "<think>...</think>" and keep only the SQL part
-        match = re.search(r"SELECT.*", response, re.IGNORECASE | re.DOTALL)
-        return match.group(0).strip() if match else response.strip()
+        # Remove <think> tags and their contents
+        cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.IGNORECASE | re.DOTALL)
+        # Match any SQL command (a word followed by SQL-like content)
+        match = re.search(r"\b[A-Za-z]+\b.*", cleaned, re.IGNORECASE | re.DOTALL)
+        return match.group(0).strip() if match else cleaned.strip()
     
     def is_likely_sql(self, query):
         """Basic check to see if the query is likely an SQL statement."""
@@ -221,7 +268,14 @@ class VoiceAssistant:
             print(f"Error in transcription: {e}")
             return ""
 
-def record_audio(duration, sample_rate):
+# ADDED: New function for threaded recording
+def record_audio_thread(duration, sample_rate, audio_queue):
+    """Record audio in a separate thread and put the data in a queue."""
+    audio_data = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
+    sd.wait()  # Wait for recording to complete
+    audio_queue.put(audio_data)
+
+def record_audio(duration, sample_rate):  # Note: This function is no longer used but left in code
     """Record audio and return the data - moved outside of the Streamlit callback"""
     audio_data = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
     return audio_data
@@ -249,6 +303,9 @@ def main():
         st.session_state.transcription = ""
     if 'processing_complete' not in st.session_state:
         st.session_state.processing_complete = False
+    # ADDED: Initialize audio queue in session state
+    if 'audio_queue' not in st.session_state:
+        st.session_state.audio_queue = Queue()
     
     # Sidebar for configuration
     with st.sidebar:
@@ -301,6 +358,8 @@ def main():
     # Main content area
     tabs = st.tabs(["Voice Interaction", "Text Interaction", "Database Explorer"])
     
+    # Voice Interaction Tab
+    # Voice Interaction Tab
     # Voice Interaction Tab
     with tabs[0]:
         st.header("Voice Interaction")
@@ -390,7 +449,7 @@ def main():
                 
                 if st.session_state.response:
                     st.code(st.session_state.response)
-    
+        
     # Text Interaction Tab
     with tabs[1]:
         st.header("Text Interaction")

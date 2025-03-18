@@ -55,8 +55,8 @@ class VoiceAssistant:
     def _generate_query(self, question, schema_text):
         if self.db_config['db_type'] in ['mysql', 'postgresql', 'sqlite', 'sqlserver']:
             prompt = ChatPromptTemplate.from_messages([
-                ("system", "Generate an SQL query based on the schema: {schema}\nQuestion: {question}"),
-                ("user", "")
+            ("system", "You are an expert SQL query generator. Based on the provided database schema, generate only the SQL query for the given user question. Do not include any explanations, additional text, or comments."),
+            ("user", "Schema: {schema}\nQuestion: {question}")
             ])
         elif self.db_config['db_type'] == 'mongodb':
             prompt = ChatPromptTemplate.from_messages([
@@ -65,6 +65,7 @@ class VoiceAssistant:
             ])
         chain = prompt | self.llm_model | self.output_parser
         response = chain.invoke({"question": question, "schema": schema_text})
+        # print(response)
         return re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
 
     def _generate_final_response(self, sql_data, question):

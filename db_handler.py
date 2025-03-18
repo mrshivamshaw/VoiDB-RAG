@@ -5,8 +5,18 @@ import json
 from cryptography.fernet import Fernet
 import os
 
-# Encryption key (generate once and store securely)
-key = Fernet.generate_key()  # In production, store this securely
+# # Encryption key (generate once and store securely)
+# key = Fernet.generate_key()  # In production, store this securely
+# print("Encryption key:", key.decode())
+
+
+key = os.getenv("FERNET_KEY")
+if not key:
+    raise ValueError("FERNET_KEY environment variable not set")
+    
+# Convert the string back to bytes if stored as string
+if isinstance(key, str):
+    key = key.encode()
 cipher = Fernet(key)
 
 def encrypt_password(password: str) -> str:

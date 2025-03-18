@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session, sessionmaker
 from pydantic import BaseModel
 import os
+import uuid
 import whisper
 from typing import Optional
 from langchain_community.llms import Ollama
@@ -11,6 +12,7 @@ from models import User, DBConfig, engine
 from auth import get_current_user, verify_password, get_password_hash, create_access_token
 from db_handler import encrypt_password, extract_schema
 from assistant import VoiceAssistant
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 app = FastAPI()
 SessionLocal = sessionmaker(bind=engine)
@@ -88,13 +90,30 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
     if not db_config:
         raise HTTPException(status_code=400, detail="No database configuration found")
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        sf.write(tmp.name, await audio.read(), 16000, format='WAV')
+    # Create a unique temp file path
+    temp_file_path = os.path.join(tempfile.gettempdir(), f"voice_query_{uuid.uuid4().hex}.wav")
+    
+    try:
+        # Save the uploaded file directly
+        content = await audio.read()
+        with open(temp_file_path, "wb") as f:
+            f.write(content)
+        
+        # Process the audio file
         assistant = VoiceAssistant(db_config.__dict__, app.state.whisper_model, app.state.llm_model)
-        transcription = assistant.transcribe_audio(tmp.name)
+        transcription = assistant.transcribe_audio(temp_file_path)
         response = assistant.get_response(transcription)
-        os.remove(tmp.name)
-    return {"transcription": transcription, "response": response}
+        
+        return {"transcription": transcription, "response": response}
+    
+    finally:
+        # Try to remove the file in the finally block
+        try:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+        except Exception as e:
+            # Just log the error but don't fail the request
+            print(f"Error removing temporary file: {e}")
 
 @app.post("/text-query")
 def text_query(request: TextQueryRequest, current_user: str = Depends(get_current_user), db: Session = Depends(get_db)):
