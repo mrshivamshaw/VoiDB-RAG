@@ -38,6 +38,7 @@ app = FastAPI()
 # List of allowed origins (frontend URLs)
 origins = [
     "http://localhost:3000",  # React frontend (or any other frontend running locally)
+    "https://voi-db.vercel.app/",  # Vercel frontend
 ]
 
 app.add_middleware(
