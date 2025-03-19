@@ -7,4 +7,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Send request to keep backend active
-        run: curl -X GET https://voidb-rag.onrender.com
+        run: curl -X GET https://voidb-rag.onrender.com/health
