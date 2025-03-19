@@ -1,8 +1,20 @@
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
+import os
+from dotenv import load_dotenv
+load_dotenv()
+DATABASE_URL = os.environ.get("DB_URI")
 
-engine = create_engine('sqlite:///app.db')
+# Create engine with proper configuration for Neon
+engine = create_engine(
+    DATABASE_URL,
+    # These settings help with Neon's serverless nature
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,
+    pool_recycle=1800,
+)
 Base = declarative_base()
 
 class User(Base):

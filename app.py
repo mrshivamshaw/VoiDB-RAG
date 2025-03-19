@@ -5,15 +5,18 @@ import os
 import uuid
 import whisper
 from typing import Optional
-from langchain_community.llms import Ollama
 import tempfile
 import soundfile as sf
 from models import User, DBConfig, engine
 from auth import get_current_user, verify_password, get_password_hash, create_access_token
 from db_handler import encrypt_password, extract_schema
 from assistant import VoiceAssistant
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+from langchain_groq import ChatGroq
+from dotenv import load_dotenv
 
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+load_dotenv()
 app = FastAPI()
 SessionLocal = sessionmaker(bind=engine)
 
@@ -21,7 +24,15 @@ SessionLocal = sessionmaker(bind=engine)
 @app.on_event("startup")
 async def startup_event():
     app.state.whisper_model = whisper.load_model("tiny")  # Load Whisper model once
-    app.state.llm_model = Ollama(model="deepseek-r1:1.5b")  # Load LLM once
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if not groq_api_key:
+        raise ValueError("GROQ_API_KEY environment variable must be set")
+    
+    # Initialize the Groq model with the correct parameter name
+    app.state.llm_model = ChatGroq(
+        api_key=groq_api_key,
+        model_name="llama3-70b-8192"  # Use a model that's available in Groq
+    )
 
 class UserCreate(BaseModel):
     username: str

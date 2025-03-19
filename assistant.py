@@ -42,37 +42,99 @@ class VoiceAssistant:
         return result["text"].strip()
 
     def get_response(self, question):
+        # Check for common greetings and pleasantries first
+        greeting_patterns = [
+            r'\b(hi|hello|hey|greetings|howdy)\b',
+            r'\b(thank you|thanks)\b',
+            r'\b(good morning|good afternoon|good evening)\b'
+        ]
+        
+        for pattern in greeting_patterns:
+            if re.search(pattern, question.lower()):
+                return "Hello! I'm your database assistant. How can I help with your database queries today?"
+        
+        # Continue with normal processing for database queries
         retrieved_docs = self.vector_db.similarity_search_with_score(question, k=1)
         if not retrieved_docs or retrieved_docs[0][1] > 1.0:
-            return "Query is out of schema context!"
+            return "I can only answer questions about your database schema. Your query appears to be out of context."
+        
         schema_text = retrieved_docs[0][0].page_content
         query = self._generate_query(question, schema_text)
         if not query:
-            return "Could not generate a valid query."
+            return "I couldn't generate a valid database query from your question. Could you rephrase it?"
+        
+        print("sql query", query)
         sql_response = execute_query(self.db_config, query)
         return self._generate_final_response(sql_response, question)
 
     def _generate_query(self, question, schema_text):
         if self.db_config['db_type'] in ['mysql', 'postgresql', 'sqlite', 'sqlserver']:
             prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an expert SQL query generator. Based on the provided database schema, generate only the SQL query for the given user question. Do not include any explanations, additional text, or comments."),
-            ("user", "Schema: {schema}\nQuestion: {question}")
+                ("system", """You are an expert SQL query generator that ONLY generates SQL for database-related questions.
+
+    IMPORTANT: 
+    - First, determine if the question is actually about querying the database or accessing data.
+    - If the question is NOT about data retrieval or database operations (such as 'make a tea', 'what's the weather', etc.), respond ONLY with the exact text 'NOT_DB_QUERY'.
+    - Do not attempt to generate SQL for non-database questions.
+    - If the question is a database query, generate ONLY the SQL query with no explanations or comments.
+
+    Follow the schema EXACTLY when writing queries - do not reference tables or columns that don't exist in the schema.
+
+    Schema information:
+    {schema}
+
+    User question:
+    {question}"""),
+                ("user", "")
             ])
         elif self.db_config['db_type'] == 'mongodb':
             prompt = ChatPromptTemplate.from_messages([
-                ("system", "Generate a MongoDB query in JSON format based on the schema: {schema}\nQuestion: {question}\nFormat: {'collection': '...', 'operation': 'find', 'query': {...}, 'projection': {...}}"),
+                ("system", """You are an expert MongoDB query generator that ONLY generates queries for database-related questions.
+
+    IMPORTANT: 
+    - First, determine if the question is actually about querying the database or accessing data.
+    - If the question is NOT about data retrieval or database operations (such as 'make a tea', 'what's the weather', etc.), respond ONLY with the exact text 'NOT_DB_QUERY'.
+    - Do not attempt to generate MongoDB queries for non-database questions.
+    - If the question is a database query, generate ONLY the MongoDB query in the format specified below with no explanations.
+
+    Format for valid queries: {'collection': '...', 'operation': 'find', 'query': {...}, 'projection': {...}}
+
+    Schema information:
+    {schema}
+
+    User question:
+    {question}"""),
                 ("user", "")
             ])
+        
         chain = prompt | self.llm_model | self.output_parser
         response = chain.invoke({"question": question, "schema": schema_text})
-        # print(response)
+        print("query generation response:", response)
+        
+        # Check if the model indicated this is not a database query
+        if "NOT_DB_QUERY" in response:
+            return ""
+        
         return re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
 
     def _generate_final_response(self, sql_data, question):
+        # Create a more contextually aware prompt
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Generate a natural language response based on query results: {schema}\nQuestion: {question}"),
+            ("system", """You are a helpful database assistant. Respond to the user's question based on the context:
+
+    1. If the question is a greeting (like "hello", "hi", "good morning", "thank you", etc.), respond with a friendly greeting.
+
+    2. If SQL data is provided, generate a natural language response that explains the data results clearly.
+
+    3. If the question is about database schema and SQL data is available, answer based on the schema information.
+
+    4. If the query is unrelated to databases or the available schema, politely inform the user that the question is out of context and you can only help with database-related queries.
+
+    SQL Query Results: {sql_response}
+    User Question: {question}"""),
             ("user", "")
         ])
+        
         chain = prompt | self.llm_model | self.output_parser
-        response = chain.invoke({"question": question, "schema": sql_data})
+        response = chain.invoke({"question": question, "sql_response": sql_data})
         return re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()

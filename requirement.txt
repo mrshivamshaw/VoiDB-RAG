@@ -9,6 +9,7 @@ whisper
 langchain
 langchain-openai
 langchain-community
+langchain-groq
 faiss-cpu
 passlib[bcrypt]
 pyjwt
@@ -16,3 +17,7 @@ cryptography
 soundfile
 sounddevice
 numpy
+groq
+python-dotenv
+pydantic
+python-multipart
