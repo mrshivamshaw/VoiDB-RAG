@@ -432,11 +432,6 @@ def text_query(request: TextQueryRequest, current_user: str = Depends(get_curren
 def health_check():
     """Health check endpoint to verify service is running"""
     try:
-        # Check database connectivity
-        db = SessionLocal()
-        db.execute("SELECT 1")
-        db.close()
-        
         # Check if models are loaded
         if not hasattr(app.state, "whisper_model") or not hasattr(app.state, "llm_model"):
             return JSONResponse(
