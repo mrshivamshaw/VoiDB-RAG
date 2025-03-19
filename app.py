@@ -3,7 +3,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from pydantic import BaseModel
 import os
 import uuid
-import whisper
 from typing import Optional
 import tempfile
 import soundfile as sf
@@ -13,6 +12,7 @@ from db_handler import encrypt_password, extract_schema
 from assistant import VoiceAssistant
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
+from groq import Groq
 
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -23,8 +23,8 @@ SessionLocal = sessionmaker(bind=engine)
 # Load models on startup
 @app.on_event("startup")
 async def startup_event():
-    app.state.whisper_model = whisper.load_model("tiny")  # Load Whisper model once
     groq_api_key = os.environ.get("GROQ_API_KEY")
+    app.state.whisper_model = Groq(api_key=groq_api_key)
     if not groq_api_key:
         raise ValueError("GROQ_API_KEY environment variable must be set")
     
@@ -45,7 +45,8 @@ class DBConfigCreate(BaseModel):
     username: str
     password: str
     database_name: str
-    schema_json: Optional[str] = None  # Optional for MongoDB
+    db_schema_json: Optional[str] = None  # Renamed from schema_json to db_schema_json
+
     
 class TextQueryRequest(BaseModel):
     query: str
@@ -86,7 +87,7 @@ def save_db_config(config: DBConfigCreate, current_user: str = Depends(get_curre
         "username": config.username,
         "encrypted_password": encrypted_password,
         "database_name": config.database_name,
-        "schema_json": config.schema_json
+        "db_schema_json": config.db_schema_json
     }
     new_config = DBConfig(user_id=db_user.id, **db_config)
     db.add(new_config)
@@ -109,10 +110,17 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
         content = await audio.read()
         with open(temp_file_path, "wb") as f:
             f.write(content)
-        
+                
         # Process the audio file
+        transcription = ""
         assistant = VoiceAssistant(db_config.__dict__, app.state.whisper_model, app.state.llm_model)
-        transcription = assistant.transcribe_audio(temp_file_path)
+        with open(temp_file_path, "rb") as file:
+            transcription = app.state.whisper_model.audio.transcriptions.create(
+                file=(temp_file_path, file.read()),
+                model="whisper-large-v3",
+                response_format="verbose_json",
+            )
+        transcription = transcription.text
         response = assistant.get_response(transcription)
         
         return {"transcription": transcription, "response": response}

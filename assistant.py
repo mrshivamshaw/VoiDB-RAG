@@ -1,4 +1,3 @@
-import whisper
 from langchain_community.llms import Ollama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -63,7 +62,7 @@ class VoiceAssistant:
         if not query:
             return "I couldn't generate a valid database query from your question. Could you rephrase it?"
         
-        print("sql query", query)
+        # print("sql query", query)
         sql_response = execute_query(self.db_config, query)
         return self._generate_final_response(sql_response, question)
 
@@ -109,7 +108,7 @@ class VoiceAssistant:
         
         chain = prompt | self.llm_model | self.output_parser
         response = chain.invoke({"question": question, "schema": schema_text})
-        print("query generation response:", response)
+        # print("query generation response:", response)
         
         # Check if the model indicated this is not a database query
         if "NOT_DB_QUERY" in response:

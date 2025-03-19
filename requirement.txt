@@ -5,13 +5,14 @@ pymongo
 mysql-connector-python
 psycopg2-binary
 pyodbc
-openai-whisper
 langchain
 langchain-openai
 langchain-community
 langchain-groq
 faiss-cpu
-passlib[bcrypt]
+passlib
+python-jose[cryptography]
+bcrypt==3.2.0
 pyjwt
 cryptography
 soundfile
