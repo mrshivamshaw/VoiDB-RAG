@@ -5,7 +5,7 @@ pymongo
 mysql-connector-python
 psycopg2-binary
 pyodbc
-whisper
+openai-whisper
 langchain
 langchain-openai
 langchain-community
