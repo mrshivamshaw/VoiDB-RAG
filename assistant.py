@@ -73,7 +73,7 @@ class VoiceAssistant:
         self.db_config = db_config
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.vector_db = None
+        # self.vector_db = self._setup_vector_db()
         
         try:
             self.vector_db = self._setup_vector_db()
@@ -410,6 +410,8 @@ class VoiceAssistant:
         3. If the question is about database schema and SQL data is available, answer based on the schema information.
 
         4. If the query is unrelated to databases or the available schema, politely inform the user that the question is out of context and you can only help with database-related queries.
+        
+        5. Give response in html and tailwindcss format.
 
         SQL Query Results: {sql_response}
         User Question: {question}"""),

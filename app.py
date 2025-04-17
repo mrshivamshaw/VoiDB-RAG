@@ -1,18 +1,16 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError, OperationalError
+
 from pydantic import BaseModel, ValidationError
 import os
 import uuid
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional
 import tempfile
 import traceback
 import soundfile as sf
-from models import User, DBConfig, engine
 from auth import get_current_user, verify_password, get_password_hash, create_access_token
-from db_handler import encrypt_password, extract_schema
+from db_handler import encrypt_password, direct_db_connect
 from assistant import VoiceAssistant
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
@@ -49,8 +47,6 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Database session handling with error catching
-SessionLocal = sessionmaker(bind=engine)
 
 # Custom exception handler for the entire application
 @app.exception_handler(Exception)
@@ -70,16 +66,6 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": "Invalid input data", "errors": exc.errors()}
-    )
-
-# Custom exception handler for database errors
-@app.exception_handler(SQLAlchemyError)
-async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-    """Handle SQLAlchemy database errors"""
-    logger.error(f"Database error: {str(exc)}\n{traceback.format_exc()}")
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "A database error occurred. Please try again later."}
     )
 
 
@@ -138,22 +124,9 @@ class DBConfigCreate(BaseModel):
 class TextQueryRequest(BaseModel):
     query: str
 
-# Database dependency with error handling
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    except OperationalError as e:
-        logger.error(f"Database connection error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection error. Please try again later."
-        )
-    finally:
-        db.close()
 
 @app.post("/signup")
-def signup(user: UserCreate, db: Session = Depends(get_db)):
+def signup(user: UserCreate):
     try:
         # Check if username is valid length
         if len(user.username) < 3:
@@ -169,9 +142,13 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
                 detail="Password must be at least 8 characters long"
             )
             
+        # Get database connection
+        db_conn = direct_db_connect()
+        cursor = db_conn.cursor()
+        
         # Check if username already exists
-        db_user = db.query(User).filter(User.username == user.username).first()
-        if db_user:
+        cursor.execute("SELECT id FROM users WHERE username = %s", (user.username,))
+        if cursor.fetchone():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, 
                 detail="Username already exists"
@@ -179,40 +156,42 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
             
         # Create new user
         hashed_password = get_password_hash(user.password)
-        new_user = User(username=user.username, password_hash=hashed_password)
-        db.add(new_user)
-        db.commit()
+        cursor.execute(
+            "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
+            (user.username, hashed_password)
+        )
+        db_conn.commit()
         
         logger.info(f"New user created: {user.username}")
         return {"message": "User created successfully"}
         
-    except IntegrityError as e:
-        db.rollback()
-        logger.error(f"Database integrity error during signup: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username already exists or database constraint violated"
-        )
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Database error during signup: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database error occurred. Please try again later."
-        )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        db.rollback()
         logger.error(f"Unexpected error during signup: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred. Please try again later."
         )
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'db_conn' in locals():
+            db_conn.close()
 
 @app.post("/login")
-def login(user: UserCreate, db: Session = Depends(get_db)):
+def login(user: UserCreate):
     try:
-        db_user = db.query(User).filter(User.username == user.username).first()
-        if not db_user or not verify_password(user.password, db_user.password_hash):
+        # Get database connection
+        db_conn = direct_db_connect()
+        cursor = db_conn.cursor()
+        
+        # Get user
+        cursor.execute("SELECT id, password_hash FROM users WHERE username = %s", (user.username,))
+        db_user = cursor.fetchone()
+        
+        if not db_user or not verify_password(user.password, db_user[1]):  # db_user[1] is the password_hash
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, 
                 detail="Invalid username or password"
@@ -231,80 +210,120 @@ def login(user: UserCreate, db: Session = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred during login. Please try again later."
         )
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'db_conn' in locals():
+            db_conn.close()
 
 @app.post("/db-config")
-def save_db_config(config: DBConfigCreate, current_user: str = Depends(get_current_user), db: Session = Depends(get_db)):
+def save_db_config(config: DBConfigCreate, current_user: str = Depends(get_current_user)):
     try:
-        db_user = db.query(User).filter(User.username == current_user).first()
-        if not db_user:
+        # Get database connection
+        db_conn = direct_db_connect()
+        cursor = db_conn.cursor()
+        
+        # Get user ID
+        cursor.execute("SELECT id FROM users WHERE username = %s", (current_user,))
+        user_result = cursor.fetchone()
+        if not user_result:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, 
                 detail="User not found"
             )
+        user_id = user_result[0]
             
-        # Check if configuration already exists and update it
-        existing_config = db.query(DBConfig).filter(DBConfig.user_id == db_user.id).first()
+        # Check if configuration already exists
+        cursor.execute("SELECT id FROM db_configs WHERE user_id = %s", (user_id,))
+        existing_config = cursor.fetchone()
         
         encrypted_password = encrypt_password(config.password)
-        db_config = {
-            "db_type": config.db_type,
-            "host": config.host,
-            "port": config.port,
-            "username": config.username,
-            "encrypted_password": encrypted_password,
-            "database_name": config.database_name,
-            "db_schema_json": config.db_schema_json
-        }
         
         if existing_config:
             # Update existing configuration
-            for key, value in db_config.items():
-                setattr(existing_config, key, value)
+            cursor.execute("""
+                UPDATE db_configs 
+                SET db_type = %s, host = %s, port = %s, username = %s, 
+                    encrypted_password = %s, database_name = %s, db_schema_json = %s
+                WHERE user_id = %s
+            """, (
+                config.db_type, config.host, config.port, config.username,
+                encrypted_password, config.database_name, config.db_schema_json,
+                user_id
+            ))
             message = "Database configuration updated"
         else:
             # Create new configuration
-            new_config = DBConfig(user_id=db_user.id, **db_config)
-            db.add(new_config)
+            cursor.execute("""
+                INSERT INTO db_configs 
+                (user_id, db_type, host, port, username, encrypted_password, database_name, db_schema_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                user_id, config.db_type, config.host, config.port, config.username,
+                encrypted_password, config.database_name, config.db_schema_json
+            ))
             message = "Database configuration saved"
             
-        db.commit()
+        db_conn.commit()
         
         logger.info(f"DB config saved/updated for user: {current_user}")
         return {"message": message}
         
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Database error while saving DB config: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database error occurred while saving configuration"
-        )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        db.rollback()
         logger.error(f"Error saving DB config: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred while saving database configuration"
         )
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'db_conn' in locals():
+            db_conn.close()
 
 @app.post("/voice-query")
-async def voice_query(audio: UploadFile = File(...), current_user: str = Depends(get_current_user), db: Session = Depends(get_db)):
+async def voice_query(audio: UploadFile = File(...), current_user: str = Depends(get_current_user)):
     temp_file_path = None
     try:
-        # Validate user and configuration
-        db_user = db.query(User).filter(User.username == current_user).first()
-        if not db_user:
+        # Get database connection
+        db_conn = direct_db_connect()
+        cursor = db_conn.cursor()
+        
+        # Get user ID
+        cursor.execute("SELECT id FROM users WHERE username = %s", (current_user,))
+        user_result = cursor.fetchone()
+        if not user_result:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
+        user_id = user_result[0]
             
-        db_config = db.query(DBConfig).filter(DBConfig.user_id == db_user.id).first()
-        if not db_config:
+        # Get DB config
+        cursor.execute("""
+            SELECT db_type, host, port, username, encrypted_password, database_name, db_schema_json
+            FROM db_configs WHERE user_id = %s
+        """, (user_id,))
+        db_config_data = cursor.fetchone()
+        
+        if not db_config_data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No database configuration found. Please set up your database first."
             )
+            
+        db_config = {
+            "db_type": db_config_data[0],
+            "host": db_config_data[1],
+            "port": db_config_data[2],
+            "username": db_config_data[3],
+            "encrypted_password": db_config_data[4],
+            "database_name": db_config_data[5],
+            "db_schema_json": db_config_data[6]
+        }
         
         # Validate file type and size
         if not audio.filename.lower().endswith(('.wav', '.mp3', '.flac', '.ogg')):
@@ -346,7 +365,7 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
             transcription_text = transcription.text
             
             # Process the transcription
-            assistant = VoiceAssistant(db_config.__dict__, app.state.whisper_model, app.state.llm_model)
+            assistant = VoiceAssistant(db_config, app.state.whisper_model, app.state.llm_model)
             response = assistant.get_response(transcription_text)
             
             logger.info(f"Successfully processed voice query for user: {current_user}")
@@ -376,9 +395,14 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
                 os.remove(temp_file_path)
         except Exception as e:
             logger.error(f"Error removing temporary file: {str(e)}")
+            
+        if 'cursor' in locals():
+            cursor.close()
+        if 'db_conn' in locals():
+            db_conn.close()
 
 @app.post("/text-query")
-def text_query(request: TextQueryRequest, current_user: str = Depends(get_current_user), db: Session = Depends(get_db)):
+def text_query(request: TextQueryRequest, current_user: str = Depends(get_current_user)):
     try:
         # Validate query
         if not request.query or len(request.query.strip()) == 0:
@@ -386,25 +410,47 @@ def text_query(request: TextQueryRequest, current_user: str = Depends(get_curren
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Query cannot be empty"
             )
-            
-        # Validate user and configuration
-        db_user = db.query(User).filter(User.username == current_user).first()
-        if not db_user:
+        
+        # Get database connection
+        db_conn = direct_db_connect()
+        cursor = db_conn.cursor()
+        
+        # Get user ID
+        cursor.execute("SELECT id FROM users WHERE username = %s", (current_user,))
+        user_result = cursor.fetchone()
+        if not user_result:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
+        user_id = user_result[0]
             
-        db_config = db.query(DBConfig).filter(DBConfig.user_id == db_user.id).first()
-        if not db_config:
+        # Get DB config
+        cursor.execute("""
+            SELECT db_type, host, port, username, encrypted_password, database_name, db_schema_json
+            FROM db_configs WHERE user_id = %s
+        """, (user_id,))
+        db_config_data = cursor.fetchone()
+        
+        if not db_config_data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No database configuration found. Please set up your database first."
             )
+            
+        db_config = {
+            "db_type": db_config_data[0],
+            "host": db_config_data[1],
+            "port": db_config_data[2],
+            "username": db_config_data[3],
+            "encrypted_password": db_config_data[4],
+            "database_name": db_config_data[5],
+            "db_schema_json": db_config_data[6]
+        }
         
         # Process the query
         try:
-            assistant = VoiceAssistant(db_config.__dict__, app.state.whisper_model, app.state.llm_model)
+            assistant = VoiceAssistant(db_config, app.state.whisper_model, app.state.llm_model)
             response = assistant.get_response(request.query)
             
             logger.info(f"Successfully processed text query for user: {current_user}")
@@ -426,6 +472,11 @@ def text_query(request: TextQueryRequest, current_user: str = Depends(get_curren
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while processing your query"
         )
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'db_conn' in locals():
+            db_conn.close()
 
 # Health check endpoint
 @app.get("/health")
@@ -437,6 +488,19 @@ def health_check():
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={"status": "unhealthy", "detail": "AI models not initialized"}
+            )
+            
+        # Test database connection
+        try:
+            db_conn = direct_db_connect()
+            cursor = db_conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+            db_conn.close()
+        except Exception as e:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"status": "unhealthy", "detail": f"Database connection failed: {str(e)}"}
             )
             
         return {"status": "healthy", "version": "1.0.0"}

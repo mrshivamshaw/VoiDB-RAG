@@ -3,6 +3,7 @@ from sqlalchemy.exc import SQLAlchemyError, ProgrammingError, OperationalError
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError, ConnectionFailure, ServerSelectionTimeoutError
 import mysql.connector
+import psycopg2
 from mysql.connector import Error as MySQLError
 import json
 from cryptography.fernet import Fernet, InvalidToken
@@ -70,6 +71,31 @@ def decrypt_password(encrypted_password: str) -> str:
     except Exception as e:
         logger.error(f"Password decryption failed: {str(e)}")
         raise ValueError("Failed to decrypt password") from e
+    
+def direct_db_connect():
+    """
+    Connect directly to the application database using a NeonTech PostgreSQL URI.
+    """
+    try:
+        # Get the database URI from environment
+        db_uri = os.environ.get("DB_URI")
+        
+        if not db_uri:
+            logger.critical("DATABASE_URL environment variable not set")
+            raise ValueError("DATABASE_URL environment variable not set")
+            
+        logger.info("Connecting to PostgreSQL database using NeonTech URI")
+        
+        # Connect to PostgreSQL using the URI
+        connection = psycopg2.connect(db_uri)
+        
+        # Set autocommit to False to enable transaction control
+        connection.autocommit = False
+        
+        return connection
+    except Exception as e:
+        logger.error(f"Database connection error: {str(e)}\n{traceback.format_exc()}")
+        raise
 
 def validate_db_config(db_config: Dict[str, Any]) -> None:
     """Validate that the database configuration has all required fields."""
