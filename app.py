@@ -513,6 +513,6 @@ def health_check():
             content={"status": "unhealthy", "detail": str(e)}
         )
 
-@app.get("/", methods=["GET", "HEAD"])
+@app.api_route("/", methods=["GET", "HEAD"])
 def home():
     return {"status": "OK", "message": "API is running"}
