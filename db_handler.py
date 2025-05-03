@@ -12,6 +12,7 @@ import logging
 from typing import Dict, List, Any, Union, Optional
 import traceback
 from dotenv import load_dotenv
+from cryptography.fernet import Fernet
 
 load_dotenv()
 
@@ -30,16 +31,18 @@ def get_encryption_key() -> bytes:
         if not key:
             logger.critical("FERNET_KEY environment variable not set")
             raise ValueError("FERNET_KEY environment variable not set")
-            
-        # Convert the string back to bytes if stored as string
-        if isinstance(key, str):
-            key = key.encode()
-            
-        # Validate the key is a valid Fernet key
-        if len(key) != 32 and not key.startswith(b'dGVzdA=='):
+        
+        # Convert to bytes
+        key_bytes = key.encode() if isinstance(key, str) else key
+
+        # Try creating a Fernet instance to validate the key
+        try:
+            Fernet(key_bytes)
+        except Exception:
             logger.warning("The provided key appears to be an invalid Fernet key")
-            
-        return key
+
+        return key_bytes
+
     except Exception as e:
         logger.critical(f"Failed to retrieve encryption key: {str(e)}")
         raise
