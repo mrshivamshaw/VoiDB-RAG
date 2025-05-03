@@ -11,6 +11,9 @@ import os
 import logging
 from typing import Dict, List, Any, Union, Optional
 import traceback
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(

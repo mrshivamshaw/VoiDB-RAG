@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 name: Keep Server Alive
 on:
   schedule:
@@ -8,3 +9,15 @@ jobs:
     steps:
       - name: Send request to keep backend active
         run: curl -X GET https://voidb-rag.onrender.com/health
+=======
+name: Keep Server Alive
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # Runs every 15 minutes
+jobs:
+  keep_alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send request to keep backend active
+        run: curl -X GET https://voidb-rag.onrender.com/health
+>>>>>>> 3b64c427a796b125a9b4357b674c0d9d52f2f7a7
