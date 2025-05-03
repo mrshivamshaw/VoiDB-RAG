@@ -512,3 +512,7 @@ def health_check():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"status": "unhealthy", "detail": str(e)}
         )
+
+@app.get("/")
+def home():
+    return {"status": "OK", "message": "API is running"}
