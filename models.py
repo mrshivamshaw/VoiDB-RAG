@@ -37,5 +37,3 @@ class DBConfig(Base):
     db_schema_json = Column(String, nullable=True)  # For MongoDB, optional JSON schema
     faiss_index_path = Column(String , nullable=True)  # Path to FAISS index file
     user = relationship("User", back_populates="db_configs")
-
-Base.metadata.create_all(engine)

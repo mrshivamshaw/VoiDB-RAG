@@ -16,6 +16,7 @@ from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 from groq import Groq
 from fastapi.middleware.cors import CORSMiddleware
+from models import Base, engine
 
 
 # Configure logging
@@ -74,6 +75,14 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
 @app.on_event("startup")
 async def startup_event():
     try:
+        # Check if the database is initialized
+        try:
+            Base.metadata.create_all(engine)            
+            logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.critical(f"Database initialization failed: {str(e)}")
+            raise
+        
         groq_api_key = os.environ.get("GROQ_API_KEY")
         if not groq_api_key:
             logger.critical("GROQ_API_KEY environment variable is not set")
