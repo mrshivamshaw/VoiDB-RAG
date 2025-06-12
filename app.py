@@ -8,17 +8,17 @@ import logging
 from typing import Optional
 import tempfile
 import traceback
-import soundfile as sf
 from auth import get_current_user, verify_password, get_password_hash, create_access_token
 from db_handler import encrypt_password, direct_db_connect
 from assistant import VoiceAssistant
-from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 from groq import Groq
 from fastapi.middleware.cors import CORSMiddleware
 from models import Base, engine
+from contextlib import asynccontextmanager
 
 
+load_dotenv()
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -31,8 +31,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-load_dotenv()
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    startup_event()
+    yield
+    # Clean up the ML models and release the resources
+    shutdown_event()
+
+app = FastAPI(lifespan=lifespan)
 
 # List of allowed origins (frontend URLs)
 origins = [
@@ -71,9 +78,8 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
     )
 
 
-# Load models on startup with robust error handling
-@app.on_event("startup")
-async def startup_event():
+# Load models on startup
+def startup_event():
     try:
         # Check if the database is initialized
         try:
@@ -90,21 +96,10 @@ async def startup_event():
         
         # Initialize Groq client
         try:
-            app.state.whisper_model = Groq(api_key=groq_api_key)
-            logger.info("Groq Whisper model initialized successfully")
+            app.state.groq_model = Groq(api_key=groq_api_key)
+            logger.info("Groq model initialized successfully")
         except Exception as e:
-            logger.critical(f"Failed to initialize Groq Whisper model: {str(e)}")
-            raise
-        
-        # Initialize the Groq LLM model
-        try:
-            app.state.llm_model = ChatGroq(
-                api_key=groq_api_key,
-                model_name="llama3-70b-8192"  # Use a model that's available in Groq
-            )
-            logger.info("Groq LLM model initialized successfully")
-        except Exception as e:
-            logger.critical(f"Failed to initialize Groq LLM model: {str(e)}")
+            logger.critical(f"Failed to initialize Groq model: {str(e)}")
             raise
             
     except Exception as e:
@@ -113,10 +108,8 @@ async def startup_event():
         raise
 
 # Graceful shutdown
-@app.on_event("shutdown")
-async def shutdown_event():
+def shutdown_event():
     logger.info("Application shutting down")
-    # Add any cleanup code here if needed
 
 class UserCreate(BaseModel):
     username: str
@@ -129,7 +122,7 @@ class DBConfigCreate(BaseModel):
     username: str
     password: str
     database_name: str
-    db_schema_json: Optional[str] = None  # Renamed from schema_json to db_schema_json
+    db_schema_json: Optional[str] = None
 
 class TextQueryRequest(BaseModel):
     query: str
@@ -278,10 +271,6 @@ def save_db_config(config: DBConfigCreate, current_user: str = Depends(get_curre
         
         logger.info(f"DB config saved/updated for user: {current_user}")
         return {"message": message}
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
     except Exception as e:
         logger.error(f"Error saving DB config: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(
@@ -360,7 +349,7 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
         try:
             with open(temp_file_path, "rb") as file:
                 # Try to transcribe the audio
-                transcription = app.state.whisper_model.audio.transcriptions.create(
+                transcription = app.state.groq_model.audio.transcriptions.create(
                     file=(temp_file_path, file.read()),
                     model="whisper-large-v3",
                     response_format="verbose_json",
@@ -375,7 +364,7 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
             transcription_text = transcription.text
             
             # Process the transcription
-            assistant = VoiceAssistant(db_config, app.state.whisper_model, app.state.llm_model)
+            assistant = VoiceAssistant(db_config, app.state.groq_model)
             response = assistant.get_response(transcription_text)
             
             logger.info(f"Successfully processed voice query for user: {current_user}")
@@ -387,10 +376,6 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Error processing audio file"
             )
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
     except Exception as e:
         logger.error(f"Unexpected error in voice query: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(
@@ -460,7 +445,7 @@ def text_query(request: TextQueryRequest, current_user: str = Depends(get_curren
         
         # Process the query
         try:
-            assistant = VoiceAssistant(db_config, app.state.whisper_model, app.state.llm_model)
+            assistant = VoiceAssistant(db_config, app.state.groq_model)
             response = assistant.get_response(request.query)
             
             logger.info(f"Successfully processed text query for user: {current_user}")
@@ -472,10 +457,6 @@ def text_query(request: TextQueryRequest, current_user: str = Depends(get_curren
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Error processing your query"
             )
-            
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
     except Exception as e:
         logger.error(f"Unexpected error in text query: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(
@@ -494,7 +475,7 @@ def health_check():
     """Health check endpoint to verify service is running"""
     try:
         # Check if models are loaded
-        if not hasattr(app.state, "whisper_model") or not hasattr(app.state, "llm_model"):
+        if not hasattr(app.state, "groq_model"):
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={"status": "unhealthy", "detail": "AI models not initialized"}
