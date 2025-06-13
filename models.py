@@ -23,6 +23,7 @@ class User(Base):
     username = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)
     db_configs = relationship("DBConfig", back_populates="user")
+    embedding_id = Column(String, nullable=True)
 
 class DBConfig(Base):
     __tablename__ = 'db_configs'

@@ -52,18 +52,16 @@ class QueryExecutionError(VoiceAssistantError):
     pass
 
 class VoiceAssistant:
-    def __init__(self, db_config, groq_model, max_retries=3, retry_delay=1):
+    def __init__(self, groq_model, max_retries=3, retry_delay=1):
         """
         Initialize the VoiceAssistant with error handling and retry logic.
         
         Args:
-            db_config: Database configuration dictionary
             groq_model: LLM model for query generation and response formatting
             max_retries: Maximum number of retries for external API calls
             retry_delay: Delay between retries in seconds
         """
         self.llm_model = groq_model
-        self.db_config = db_config
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.model_name = "llama3-8b-8192"
@@ -79,17 +77,17 @@ class VoiceAssistant:
             logger.error(f"Failed to initialize Pinecone: {str(e)}")
             raise
         
-        try:
-            self._setup_pinecone_vectors()
-            logger.info("VoiceAssistant initialized successfully with Pinecone")
-        except SchemaExtractionError as e:
-            logger.error(f"Failed to extract schema: {str(e)}")
-        except EmbeddingError as e:
-            logger.error(f"Failed to create embeddings: {str(e)}")
-        except Exception as e:
-            logger.error(f"Initialization error: {str(e)}\n{traceback.format_exc()}")
+        # try:
+        #     self._setup_pinecone_vectors()
+        #     logger.info("VoiceAssistant initialized successfully with Pinecone")
+        # except SchemaExtractionError as e:
+        #     logger.error(f"Failed to extract schema: {str(e)}")
+        # except EmbeddingError as e:
+        #     logger.error(f"Failed to create embeddings: {str(e)}")
+        # except Exception as e:
+        #     logger.error(f"Initialization error: {str(e)}\n{traceback.format_exc()}")
 
-    def _setup_pinecone_vectors(self):
+    def _setup_pinecone_vectors(self, db_config):
         """
         Set up Pinecone vectors with schema data.
         
@@ -99,7 +97,7 @@ class VoiceAssistant:
         """
         try:
             # Extract schema with error handling
-            schema_texts = self._extract_schema_with_retry()
+            schema_texts = self._extract_schema_with_retry(db_config)
             
             if not schema_texts:
                 raise SchemaExtractionError("Failed to extract schema or schema is empty")
@@ -113,11 +111,12 @@ class VoiceAssistant:
             result = self.index.fetch(ids=[vector_id])
             if result.vectors:
                 logger.info("Schema vector already exists in Pinecone")
-                return
+                return vector_id
             
             # Upsert the combined schema
-            self._upsert_with_inference_api([combined_schema_text])
+            self._upsert_with_inference_api([combined_schema_text],vector_id)
             logger.info("Successfully set up Pinecone vector for combined schema")
+            return vector_id
                 
         except SchemaExtractionError:
             raise
@@ -127,7 +126,7 @@ class VoiceAssistant:
             logger.error(f"Pinecone setup error: {str(e)}\n{traceback.format_exc()}")
             raise VoiceAssistantError(f"Error setting up Pinecone vectors: {str(e)}")
 
-    def _upsert_with_inference_api(self, schema_texts: List[str]):
+    def _upsert_with_inference_api(self, schema_texts: List[str], vector_id):
         """
         Upsert a single document for the combined schema using Pinecone's Inference API.
         
@@ -152,8 +151,6 @@ class VoiceAssistant:
             embedding = response.data[0]['values']
             logger.info(f"Generated embedding for combined schema: dimension {len(embedding)}")
             
-            # Create vector dictionary
-            vector_id = self._generate_vector_id(combined_schema_text)
             vector = {
                 'id': vector_id,
                 'values': embedding,
@@ -191,56 +188,63 @@ class VoiceAssistant:
             logger.warning(f"Error checking existing vectors: {str(e)}")
             return False
 
-    def _similarity_search_pinecone(self, query: str, k: int = 1):
+    def _cosine_similarity(self,vec1, vec2):
+        if len(vec1) != len(vec2):
+            raise ValueError("Vector lengths must match")
+
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        norm_a = sum(a * a for a in vec1) ** 0.5
+        norm_b = sum(b * b for b in vec2) ** 0.5
+
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+
+        return dot_product / (norm_a * norm_b)
+
+    def _similarity_search_pinecone(self, query: str, k: int = 1, vector_id=None):
         """
         Perform similarity search using Pinecone Inference API.
         """
         try:
             # Generate embeddings for the query using Pinecone's Inference API
             response = self.pc.inference.embed(
-                model="llama-text-embed-v2",  # Replace with your embedding model
+                model="llama-text-embed-v2",
                 inputs=[query],
-                parameters={
-                    "input_type": "query"
-                }
+                parameters={"input_type": "query"}
             )
 
-            print(response)
-            
-            # Extract the embedding (list of floats)
             query_embedding = response.data[0]['values']
+
+            # Fetch existing vector from Pinecone
+            fetch_result = self.index.fetch(ids=[vector_id])
+            if vector_id not in fetch_result.vectors:
+                logger.warning(f"No vector found for ID: {vector_id}")
+                return []
+
+            stored_vector = fetch_result.vectors[vector_id]
             
-            # Perform similarity search with the embedding
-            search_results = self.index.query(
-                vector=query_embedding,  # Pass the embedding, not the raw text
-                top_k=k,
-                include_values=False,
-                include_metadata=True,
-                filter={'type': 'schema'}  # Only search schema documents
-            )
+            # Fix: Access Vector object attributes properly
+            stored_embedding = stored_vector.values  # Use .values attribute, not ['values']
             
-            # Format results
-            results = []
-            matches = search_results.matches if hasattr(search_results, 'matches') else []
-            
-            for match in matches:
-                doc_content = match.metadata.get('text', '') if match.metadata else ''
-                similarity_score = match.score if hasattr(match, 'score') else 0.0
-                
-                class MockDocument:
-                    def __init__(self, content):
-                        self.page_content = content
-                
-                results.append((MockDocument(doc_content), similarity_score))
-            
-            logger.info(f"Found {len(results)} similar documents with scores: {[r[1] for r in results]}")
-            return results
-            
+            # Fix: Access metadata properly
+            metadata = stored_vector.metadata or {}  # Use .metadata attribute
+            schema_text = metadata.get('text', '')
+
+            score = self._cosine_similarity(query_embedding, stored_embedding)
+            logger.info(f"Similarity score: {score}")
+
+            # Create a mock document object
+            class MockDocument:
+                def __init__(self, content):
+                    self.page_content = content
+
+            return [(MockDocument(schema_text), score)]
+
         except Exception as e:
             logger.error(f"Pinecone similarity search error: {str(e)}")
-            # Return empty results instead of crashing
             return []
-    def _extract_schema_with_retry(self) -> List[str]:
+
+    def _extract_schema_with_retry(self, db_config) -> List[str]:
         """
         Extract database schema with retry logic.
         
@@ -252,7 +256,7 @@ class VoiceAssistant:
         """
         for attempt in range(self.max_retries):
             try:
-                return extract_schema(self.db_config)
+                return extract_schema(db_config)
             except Exception as e:
                 logger.warning(f"Schema extraction attempt {attempt+1} failed: {str(e)}")
                 if attempt < self.max_retries - 1:
@@ -261,7 +265,7 @@ class VoiceAssistant:
                     logger.error(f"Schema extraction failed after {self.max_retries} attempts")
                     raise SchemaExtractionError(f"Failed to extract schema after {self.max_retries} attempts: {str(e)}")
 
-    def get_response(self, question: str) -> str:
+    def get_response(self, question: str, vector_id: str, db_config) -> str:
         """
         Get response to user question with comprehensive error handling.
         
@@ -290,7 +294,7 @@ class VoiceAssistant:
             
             # Perform similarity search with Pinecone
             try:
-                retrieved_docs = self._similarity_search_pinecone(question, k=1)
+                retrieved_docs = self._similarity_search_pinecone(question, k=1,vector_id=vector_id)
                 if not retrieved_docs or retrieved_docs[0][1] > 1.0:
                     return "I can only answer questions about your database schema. Your query appears to be out of context."
                 
@@ -301,7 +305,7 @@ class VoiceAssistant:
             
             # Generate query with error handling
             try:
-                query = self._generate_query(question, schema_text)
+                query = self._generate_query(question, schema_text, db_config)
                 if not query:
                     return "I couldn't generate a valid database query from your question. Could you rephrase it to be more specific about the database information you're looking for?"
             except QueryGenerationError as e:
@@ -313,7 +317,7 @@ class VoiceAssistant:
             
             # Execute query with error handling
             try:
-                sql_response = execute_query(self.db_config, query)
+                sql_response = execute_query(db_config, query)
             except Exception as e:
                 logger.error(f"Query execution error: {str(e)}\n{traceback.format_exc()}")
                 return f"I encountered an error executing the database query. The database returned: {str(e)}"
@@ -330,7 +334,7 @@ class VoiceAssistant:
             logger.error(f"Unexpected error in get_response: {str(e)}\n{traceback.format_exc()}")
             return "I encountered an unexpected error while processing your question. Please try again or check your database connection."
 
-    def _generate_query(self, question: str, schema_text: str) -> str:
+    def _generate_query(self, question: str, schema_text: str,db_config) -> str:
         """
         Generate database query with error handling using Groq SDK.
         
@@ -350,7 +354,7 @@ class VoiceAssistant:
             logger.info(f"Preprocessed question: {question}")
             
             # Select appropriate system prompt
-            if self.db_config['db_type'] in ['mysql', 'postgresql', 'sqlite', 'sqlserver']:
+            if db_config['db_type'] in ['mysql', 'postgresql', 'sqlite', 'sqlserver']:
                 system_prompt = """You are an expert SQL query generator that generates SQL for database-related questions.
 
         IMPORTANT:
@@ -366,7 +370,7 @@ class VoiceAssistant:
 
         User question:
         {question}"""
-            elif self.db_config['db_type'] == 'mongodb':
+            elif db_config['db_type'] == 'mongodb':
                 system_prompt = """You are an expert MongoDB query generator that generates queries for database-related questions.
 
         IMPORTANT:
@@ -382,7 +386,7 @@ class VoiceAssistant:
         User question:
         {question}"""
             else:
-                raise QueryGenerationError(f"Unsupported database type: {self.db_config['db_type']}")
+                raise QueryGenerationError(f"Unsupported database type: {db_config['db_type']}")
             
             formatted_prompt = system_prompt.format(schema=schema_text, question=question)
             
@@ -477,12 +481,18 @@ class VoiceAssistant:
                         top_p=1,
                         stream=False
                     )
-                    
+
+                    # Extract the actual message content from ChatCompletion object
+                    if hasattr(response, 'choices') and len(response.choices) > 0:
+                        response_content = response.choices[0].message.content
+                    else:
+                        raise Exception("Invalid response format from LLM")
+
                     # Clean and validate response
-                    cleaned_response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+                    cleaned_response = re.sub(r"<think>.*?</think>", "", response_content, flags=re.DOTALL).strip()
                     if not cleaned_response:
                         raise Exception("Generated response is empty after cleaning")
-                    
+
                     logger.info("Successfully generated final response")
                     return cleaned_response
                     

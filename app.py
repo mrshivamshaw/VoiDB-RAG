@@ -36,7 +36,6 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 async def lifespan(app: FastAPI):
     startup_event()
     yield
-    # Clean up the ML models and release the resources
     shutdown_event()
 
 app = FastAPI(lifespan=lifespan)
@@ -83,7 +82,7 @@ def startup_event():
     try:
         # Check if the database is initialized
         try:
-            Base.metadata.create_all(engine)            
+            Base.metadata.create_all(engine)
             logger.info("Database initialized successfully")
         except Exception as e:
             logger.critical(f"Database initialization failed: {str(e)}")
@@ -98,6 +97,7 @@ def startup_event():
         try:
             app.state.groq_model = Groq(api_key=groq_api_key)
             logger.info("Groq model initialized successfully")
+            app.state.voice_assistant = VoiceAssistant(app.state.groq_model)
         except Exception as e:
             logger.critical(f"Failed to initialize Groq model: {str(e)}")
             raise
@@ -156,7 +156,7 @@ def signup(user: UserCreate):
                 status_code=status.HTTP_400_BAD_REQUEST, 
                 detail="Username already exists"
             )
-            
+        
         # Create new user
         hashed_password = get_password_hash(user.password)
         cursor.execute(
@@ -254,6 +254,17 @@ def save_db_config(config: DBConfigCreate, current_user: str = Depends(get_curre
                 encrypted_password, config.database_name, config.db_schema_json,
                 user_id
             ))
+            db_config = {
+                "id": existing_config[0],
+                "db_type": config.db_type,
+                "host": config.host,
+                "port": config.port,
+                "username": config.username,
+                "encrypted_password": encrypted_password,
+                "database_name": config.database_name,
+                "db_schema_json": config.db_schema_json
+            }
+            vector_id = app.state.voice_assistant._setup_pinecone_vectors(db_config)
             message = "Database configuration updated"
         else:
             # Create new configuration
@@ -265,8 +276,25 @@ def save_db_config(config: DBConfigCreate, current_user: str = Depends(get_curre
                 user_id, config.db_type, config.host, config.port, config.username,
                 encrypted_password, config.database_name, config.db_schema_json
             ))
+            db_config = {
+                "id": cursor.lastrowid,
+                "db_type": config.db_type,
+                "host": config.host,
+                "port": config.port,
+                "username": config.username,
+                "encrypted_password": encrypted_password,
+                "database_name": config.database_name,
+                "db_schema_json": config.db_schema_json
+            }
+            vector_id = app.state.voice_assistant._setup_pinecone_vectors(db_config)
             message = "Database configuration saved"
-            
+        print(vector_id)
+        cursor.execute("""
+            UPDATE users 
+            SET embedding_id = %s
+            WHERE username = %s
+        """, (vector_id, current_user))
+
         db_conn.commit()
         
         logger.info(f"DB config saved/updated for user: {current_user}")
@@ -292,7 +320,7 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
         cursor = db_conn.cursor()
         
         # Get user ID
-        cursor.execute("SELECT id FROM users WHERE username = %s", (current_user,))
+        cursor.execute("SELECT id, embedding_id FROM users WHERE username = %s", (current_user,))
         user_result = cursor.fetchone()
         if not user_result:
             raise HTTPException(
@@ -300,7 +328,7 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
                 detail="User not found"
             )
         user_id = user_result[0]
-            
+        vector_id = user_result[1]
         # Get DB config
         cursor.execute("""
             SELECT db_type, host, port, username, encrypted_password, database_name, db_schema_json
@@ -364,8 +392,7 @@ async def voice_query(audio: UploadFile = File(...), current_user: str = Depends
             transcription_text = transcription.text
             
             # Process the transcription
-            assistant = VoiceAssistant(db_config, app.state.groq_model)
-            response = assistant.get_response(transcription_text)
+            response = app.state.voice_assistant.get_response(transcription_text,vector_id,db_config)
             
             logger.info(f"Successfully processed voice query for user: {current_user}")
             return {"transcription": transcription_text, "response": response}
@@ -411,13 +438,14 @@ def text_query(request: TextQueryRequest, current_user: str = Depends(get_curren
         cursor = db_conn.cursor()
         
         # Get user ID
-        cursor.execute("SELECT id FROM users WHERE username = %s", (current_user,))
+        cursor.execute("SELECT id, embedding_id FROM users WHERE username = %s", (current_user,))
         user_result = cursor.fetchone()
         if not user_result:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
+        vector_id = user_result[1]
         user_id = user_result[0]
             
         # Get DB config
@@ -445,8 +473,7 @@ def text_query(request: TextQueryRequest, current_user: str = Depends(get_curren
         
         # Process the query
         try:
-            assistant = VoiceAssistant(db_config, app.state.groq_model)
-            response = assistant.get_response(request.query)
+            response = app.state.voice_assistant.get_response(request.query, vector_id, db_config)
             
             logger.info(f"Successfully processed text query for user: {current_user}")
             return {"response": response}
