@@ -1,21 +1,16 @@
+# Web Framework
 fastapi
 uvicorn
 sqlalchemy
 pymongo
 mysql-connector-python
 psycopg2-binary
-pyodbc
-langchain
-langchain-openai
-langchain-community
-langchain-groq
-faiss-cpu
-passlib
+passlib[bcrypt]
 python-jose[cryptography]
-bcrypt==3.2.0
 pyjwt
 cryptography
 groq
+pinecone
 python-dotenv
 pydantic
-pinecone
+python-multipart
